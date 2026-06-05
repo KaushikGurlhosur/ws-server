@@ -1,27 +1,3 @@
-// import {
-//   WebSocketGateway,
-//   OnGatewayConnection,
-//   OnGatewayDisconnect,
-// } from '@nestjs/websockets';
-// import { WebSocket } from 'ws';
-
-// // Allow Next.js (port 3000) to connect
-// @WebSocketGateway({ cors: true })
-// export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
-//   handleConnection(client: WebSocket, ...args: any[]) {
-//     console.log('✅ Someone connected to the WebSocket!');
-
-//     // Send a welcome message back to the Next.js client
-//     client.send(
-//       JSON.stringify({ type: 'welcome', message: 'Hello from NestJS!' }),
-//     );
-//   }
-
-//   handleDisconnect(client: WebSocket) {
-//     console.log('❌ Someone disconnected.');
-//   }
-// }
-
 import {
   WebSocketGateway,
   SubscribeMessage,
@@ -36,7 +12,7 @@ import * as jwt from 'jsonwebtoken';
 import { InjectModel } from '@nestjs/mongoose';
 import { Model } from 'mongoose';
 
-@WebSocketGateway({ cors: true })
+@WebSocketGateway({ cors: true }) // 🟢 CORS is active and allowing Vercel to connect!
 export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
   @WebSocketServer()
   server: Server;
@@ -44,7 +20,6 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
   // Memory map to track who is online right now
   private clients = new Map<string, WebSocket>();
 
-  // 🟢 INJECTION: We tell NestJS to hand us the MongoDB models we created
   constructor(
     @InjectModel('User') private userModel: Model<any>,
     @InjectModel('Message') private messageModel: Model<any>,
@@ -52,44 +27,58 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
   ) {}
 
   // ==========================================
-  // 1. HANDLE CONNECTIONS (The Bouncer)
+  // 1. HANDLE CONNECTIONS (The Waiting Room)
   // ==========================================
-  async handleConnection(client: WebSocket, ...args: any[]) {
-    const request = args[0];
+  async handleConnection(client: WebSocket) {
+    // 🟢 CHANGED: We do nothing here now!
+    // We let them connect securely, but they are completely anonymous
+    // and cannot send messages until they trigger the 'authenticate' event below.
+    console.log(
+      '👀 Anonymous socket connected, waiting for secure handshake...',
+    );
+  }
 
+  // ==========================================
+  // 1.5. THE SECURE HANDSHAKE (Production Auth)
+  // ==========================================
+  @SubscribeMessage('authenticate')
+  async handleAuthentication(
+    @MessageBody() data: any,
+    @ConnectedSocket() client: WebSocket,
+  ) {
     try {
-      // 1. Grab the secure httpOnly cookie set by Next.js
-      const cookieHeader = request.headers.cookie || '';
-      const token = cookieHeader
-        .split(';')
-        .find((c) => c.trim().startsWith('token='))
-        ?.split('=')[1];
+      const { token } = data;
+      if (!token) throw new Error('No token provided');
 
-      if (!token) throw new Error('No cookie token found');
-
-      // 2. Verify the token using the shared secret
+      // 1. Verify the token securely
       const decoded = jwt.verify(
         token,
         process.env.JWT_SECRET as string,
       ) as any;
+
+      if (!decoded.isWsTicket) {
+        throw new Error('Invalid token type used for WebSocket');
+      }
+
       const userId = String(decoded.userId);
 
-      // 3. Mark them as online in memory and in MongoDB
+      // 2. Mark them as officially online in memory
       this.clients.set(userId, client);
       console.log(
-        `✅ User ${userId} joined. Total Online: ${this.clients.size}`,
+        `✅ User ${userId} authenticated. Total Online: ${this.clients.size}`,
       );
 
+      // 3. Update MongoDB
       await this.userModel.findByIdAndUpdate(userId, {
         status: 'Online',
         lastSeen: new Date(),
       });
 
-      // 4. Tell everyone else they are online
+      // 4. Broadcast to everyone else
       this.broadcastOnlineStatus(userId, true);
     } catch (error) {
-      console.log('❌ Connection rejected: Unauthorized');
-      client.close(1008, 'Unauthorized');
+      console.log('❌ Authentication failed: Invalid token');
+      client.close(1008, 'Unauthorized'); // Kick them out if token is fake
     }
   }
 
@@ -98,19 +87,16 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
   // ==========================================
   async handleDisconnect(client: WebSocket) {
     const userId = this.getUserIdFromSocket(client);
-    if (!userId) return;
+    if (!userId) return; // If an unauthenticated user leaves, do nothing
 
-    // Remove from memory
     this.clients.delete(userId);
     console.log(`❌ User ${userId} left. Remaining: ${this.clients.size}`);
 
-    // Update MongoDB
     await this.userModel.findByIdAndUpdate(userId, {
       status: 'Offline',
       lastSeen: new Date(),
     });
 
-    // Broadcast offline status
     this.broadcastOnlineStatus(userId, false);
   }
 
@@ -124,9 +110,10 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
   ) {
     const { receiverId, content, replyTo, tempId } = data;
     const senderId = this.getUserIdFromSocket(client);
+
+    // 🟢 SECURITY: If senderId is null (they never authenticated), this instantly blocks the message!
     if (!senderId || !receiverId || !content.trim()) return;
 
-    // 1. Save message to MongoDB
     const newMessage = await this.messageModel.create({
       chatType: 'User',
       sender: senderId,
@@ -136,28 +123,23 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
       status: 'sent',
     });
 
-    // Populate sender details for the frontend UI
     const populated = await newMessage.populate(
       'sender receiver',
       'name avatar username',
     );
 
-    // 2. Check if the receiver is online right now
     const recipientSocket = this.clients.get(receiverId);
 
     if (recipientSocket && recipientSocket.readyState === WebSocket.OPEN) {
-      // Send it live!
       recipientSocket.send(
         JSON.stringify({ type: 'new_message', message: populated }),
       );
 
-      // Update DB to show it was instantly delivered
       newMessage.status = 'delivered';
       newMessage.deliveredAt = new Date();
       await newMessage.save();
     }
 
-    // 3. Confirm back to the sender so their UI updates from "pending" to "sent"
     client.send(
       JSON.stringify({
         type: 'message_sent_confirm',
@@ -182,13 +164,11 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
     const group = await this.groupModel.findById(groupId);
     if (!group) return;
 
-    // 1. Save to MongoDB
     const newMessage = await this.messageModel.create({
       chatType: 'Group',
       sender: senderId,
       receiver: groupId,
       content: content.trim(),
-      // Prepare delivery tracking for everyone except the sender
       deliveryStatus: group.members
         .filter((m: any) => m.user.toString() !== senderId)
         .map((m: any) => ({ user: m.user })),
@@ -200,7 +180,6 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
     );
     const onlineInGroup: any[] = [];
 
-    // 2. Broadcast to all group members currently online
     group.members.forEach((member: any) => {
       const memberId = member.user.toString();
       if (memberId === senderId) return;
@@ -218,7 +197,6 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
       }
     });
 
-    // 3. Update delivery timestamps in bulk for those who were online
     if (onlineInGroup.length > 0) {
       await this.messageModel.updateOne(
         { _id: newMessage._id },
@@ -227,12 +205,10 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
       );
     }
 
-    // Update the group's "lastMessage" preview
     await this.groupModel.findByIdAndUpdate(groupId, {
       lastMessage: newMessage._id,
     });
 
-    // 4. Confirm back to sender
     client.send(
       JSON.stringify({
         type: 'message_sent_confirm',

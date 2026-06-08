@@ -135,6 +135,14 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
         JSON.stringify({ type: 'new_message', message: populated }),
       );
 
+      // 🟢 ADD THIS: Tell the sender the message was instantly delivered!
+      client.send(
+        JSON.stringify({
+          type: 'message_delivered',
+          messageId: newMessage._id,
+        }),
+      );
+
       newMessage.status = 'delivered';
       newMessage.deliveredAt = new Date();
       await newMessage.save();
@@ -264,10 +272,26 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
     if (!userId) return;
 
     if (chatType === 'User') {
-      await this.messageModel.findByIdAndUpdate(messageId, {
+      // 1. Update the database
+      const updatedMsg = await this.messageModel.findByIdAndUpdate(messageId, {
         status: 'read',
         readAt: new Date(),
       });
+
+      // 🟢 ADD THIS: Find the person who originally sent the message, and tell them it was read!
+      if (updatedMsg) {
+        const originalSenderSocket = this.clients.get(
+          updatedMsg.sender.toString(),
+        );
+        if (
+          originalSenderSocket &&
+          originalSenderSocket.readyState === WebSocket.OPEN
+        ) {
+          originalSenderSocket.send(
+            JSON.stringify({ type: 'read_receipt', messageId: messageId }),
+          );
+        }
+      }
     } else {
       await this.messageModel.updateOne(
         { _id: messageId, 'deliveryStatus.user': userId },

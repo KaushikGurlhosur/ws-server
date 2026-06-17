@@ -2,6 +2,11 @@ import * as mongoose from 'mongoose';
 
 export const MessageSchema = new mongoose.Schema(
   {
+    conversationId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'Conversation',
+      index: true,
+    },
     chatType: {
       type: String,
       enum: ['User', 'Group'],
@@ -45,7 +50,6 @@ export const MessageSchema = new mongoose.Schema(
     },
     deliveredAt: { type: Date },
     readAt: { type: Date },
-
     deliveryStatus: [
       {
         user: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
@@ -65,5 +69,6 @@ export const MessageSchema = new mongoose.Schema(
   { timestamps: true },
 );
 
+MessageSchema.index({ conversationId: 1, createdAt: -1 });
 MessageSchema.index({ receiver: 1, chatType: 1, createdAt: -1 });
 MessageSchema.index({ sender: 1, receiver: 1 });

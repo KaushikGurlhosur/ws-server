@@ -272,26 +272,10 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
     if (!userId) return;
 
     if (chatType === 'User') {
-      // 1. Update the database ONLY if the person asking is the actual receiver!
-      const updatedMsg = await this.messageModel.findOneAndUpdate(
-        { _id: messageId, receiver: userId }, // 🟢 SECURITY: The IDOR fix!
-        { status: 'read', readAt: new Date() },
-      );
-
-      // 🟢 ADD THIS: Find the person who originally sent the message, and tell them it was read!
-      if (updatedMsg) {
-        const originalSenderSocket = this.clients.get(
-          updatedMsg.sender.toString(),
-        );
-        if (
-          originalSenderSocket &&
-          originalSenderSocket.readyState === WebSocket.OPEN
-        ) {
-          originalSenderSocket.send(
-            JSON.stringify({ type: 'read_receipt', messageId: messageId }),
-          );
-        }
-      }
+      await this.messageModel.findByIdAndUpdate(messageId, {
+        status: 'read',
+        readAt: new Date(),
+      });
     } else {
       await this.messageModel.updateOne(
         { _id: messageId, 'deliveryStatus.user': userId },

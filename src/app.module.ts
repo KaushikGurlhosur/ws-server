@@ -5,6 +5,7 @@ import { MongooseModule } from '@nestjs/mongoose';
 import { UserSchema } from './schemas/user.schema';
 import { MessageSchema } from './schemas/message.schema';
 import { GroupSchema } from './schemas/group.schema';
+import { ConversationSchema } from './schemas/conversation.schema';
 
 @Module({
   imports: [
@@ -15,6 +16,7 @@ import { GroupSchema } from './schemas/group.schema';
       { name: 'User', schema: UserSchema },
       { name: 'Message', schema: MessageSchema },
       { name: 'Group', schema: GroupSchema },
+      { name: 'Conversation', schema: ConversationSchema },
     ]),
   ],
   providers: [ChatGateway],

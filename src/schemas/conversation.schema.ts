@@ -64,16 +64,31 @@ export const ConversationSchema = new mongoose.Schema(
   { timestamps: true },
 );
 
-// ─── 🟢 BRANCH-SCOPED ISOLATION COMPLIANCE INTERCEPTOR ───────────────────
+// ─── 🟢 VALIDATION & ARR-NORMALIZATION INTERCEPTOR ───────────────────
 ConversationSchema.pre(
   'validate',
   function (this: any, next: (err?: any) => void) {
-    // 1. Isolate type specific requirements to eliminate mutually exclusive locks
+    // Normalize fields to arrays to prevent crash vulnerabilities if incoming payload sets them to null/undefined
+    const participants = Array.isArray(this.participants)
+      ? this.participants
+      : [];
+    this.participants = participants;
+
+    const participantSettings = Array.isArray(this.participantSettings)
+      ? this.participantSettings
+      : [];
+    this.participantSettings = participantSettings;
+
     if (this.chatType === 'User') {
-      if (this.participants.length !== 2) {
+      const participantIds = participants
+        .map((p: any) => p?.toString())
+        .filter(Boolean);
+
+      // Check that there are exactly 2 participants AND they are distinct users
+      if (participantIds.length !== 2 || new Set(participantIds).size !== 2) {
         return next(
           new Error(
-            'User-to-User conversations must have exactly 2 participants',
+            'User-to-User conversations must have exactly 2 distinct participants',
           ),
         );
       }
@@ -85,7 +100,7 @@ ConversationSchema.pre(
         );
       }
     } else if (this.chatType === 'Group') {
-      if (this.participants.length < 1) {
+      if (participants.length < 1) {
         return next(
           new Error(
             'Group conversations must contain at least 1 active participant',
@@ -101,40 +116,35 @@ ConversationSchema.pre(
       }
     }
 
-    // 2. Defensive mapping via optional chaining protects against empty arrays or null records
-    const settingsUserIds = this.participantSettings.map((setting: any) =>
+    const settingsUserIds = participantSettings.map((setting: any) =>
       setting.user?.toString(),
     );
 
     if (settingsUserIds.some((id: string | undefined) => !id)) {
       return next(
         new Error(
-          'Database Integrity Error: participantSettings contains entries missing a user definition field',
+          'Database Integrity Error: participantSettings contains entries missing a user field',
         ),
       );
     }
 
-    // 3. Mathematical Duplicate Invariant Protection
     const uniqueSettingsUsers = new Set(settingsUserIds);
     if (settingsUserIds.length !== uniqueSettingsUsers.size) {
       return next(
         new Error(
-          'Vulnerability Blocked: Duplicate user configurations detected inside participantSettings array',
+          'Vulnerability Blocked: Duplicate user configurations detected inside settings array',
         ),
       );
     }
 
-    // 4. Room Membership Boundary Verifications
-    const coreRoomParticipantIds = this.participants.map((p: any) =>
-      p.toString(),
-    );
+    const coreRoomParticipantIds = participants.map((p: any) => p.toString());
     const participantSet = new Set(coreRoomParticipantIds);
 
     for (const userId of settingsUserIds) {
       if (!participantSet.has(userId)) {
         return next(
           new Error(
-            'Data Leak Blocked: participantSettings contains a user ID who is not an active member of this thread',
+            'Data Leak Blocked: participantSettings contains an inactive member ID',
           ),
         );
       }

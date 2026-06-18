@@ -12,35 +12,26 @@ import * as jwt from 'jsonwebtoken';
 import { InjectModel } from '@nestjs/mongoose';
 import { Model } from 'mongoose';
 
-@WebSocketGateway({ cors: true }) // 🟢 CORS is active and allowing Vercel to connect!
+@WebSocketGateway({ cors: true })
 export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
   @WebSocketServer()
   server: Server;
 
-  // Memory map to track who is online right now
   private clients = new Map<string, WebSocket>();
 
   constructor(
     @InjectModel('User') private userModel: Model<any>,
     @InjectModel('Message') private messageModel: Model<any>,
     @InjectModel('Group') private groupModel: Model<any>,
+    @InjectModel('Conversation') private conversationModel: Model<any>, // 🟢 Injected Model
   ) {}
 
-  // ==========================================
-  // 1. HANDLE CONNECTIONS (The Waiting Room)
-  // ==========================================
   async handleConnection(client: WebSocket) {
-    // 🟢 CHANGED: We do nothing here now!
-    // We let them connect securely, but they are completely anonymous
-    // and cannot send messages until they trigger the 'authenticate' event below.
     console.log(
       '👀 Anonymous socket connected, waiting for secure handshake...',
     );
   }
 
-  // ==========================================
-  // 1.5. THE SECURE HANDSHAKE (Production Auth)
-  // ==========================================
   @SubscribeMessage('authenticate')
   async handleAuthentication(
     @MessageBody() data: any,
@@ -50,44 +41,36 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
       const { token } = data;
       if (!token) throw new Error('No token provided');
 
-      // 1. Verify the token securely
       const decoded = jwt.verify(
         token,
         process.env.JWT_SECRET as string,
       ) as any;
-
       if (!decoded.isWsTicket) {
         throw new Error('Invalid token type used for WebSocket');
       }
 
       const userId = String(decoded.userId);
-
-      // 2. Mark them as officially online in memory
       this.clients.set(userId, client);
+
       console.log(
         `✅ User ${userId} authenticated. Total Online: ${this.clients.size}`,
       );
 
-      // 3. Update MongoDB
       await this.userModel.findByIdAndUpdate(userId, {
         status: 'Online',
         lastSeen: new Date(),
       });
 
-      // 4. Broadcast to everyone else
       this.broadcastOnlineStatus(userId, true);
     } catch (error) {
       console.log('❌ Authentication failed: Invalid token');
-      client.close(1008, 'Unauthorized'); // Kick them out if token is fake
+      client.close(1008, 'Unauthorized');
     }
   }
 
-  // ==========================================
-  // 2. HANDLE DISCONNECTS
-  // ==========================================
   async handleDisconnect(client: WebSocket) {
     const userId = this.getUserIdFromSocket(client);
-    if (!userId) return; // If an unauthenticated user leaves, do nothing
+    if (!userId) return;
 
     this.clients.delete(userId);
     console.log(`❌ User ${userId} left. Remaining: ${this.clients.size}`);
@@ -101,7 +84,7 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
   }
 
   // ==========================================
-  // 3. 1-ON-1 MESSAGING
+  // 3. 1-ON-1 MESSAGING (Linked to Conversations)
   // ==========================================
   @SubscribeMessage('private_message')
   async handlePrivateMessage(
@@ -111,10 +94,28 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
     const { receiverId, content, replyTo, tempId } = data;
     const senderId = this.getUserIdFromSocket(client);
 
-    // 🟢 SECURITY: If senderId is null (they never authenticated), this instantly blocks the message!
     if (!senderId || !receiverId || !content.trim()) return;
 
+    // 🟢 Step A: Find existing conversation or create a fallback matching thread
+    let conversation = await this.conversationModel.findOne({
+      chatType: 'User',
+      participants: { $all: [senderId, receiverId] },
+    });
+
+    if (!conversation) {
+      conversation = await this.conversationModel.create({
+        chatType: 'User',
+        participants: [senderId, receiverId],
+        participantSettings: [
+          { user: senderId, unreadCount: 0 },
+          { user: receiverId, unreadCount: 0 },
+        ],
+      });
+    }
+
+    // 🟢 Step B: Save message with conversationId reference binding
     const newMessage = await this.messageModel.create({
+      conversationId: conversation._id,
       chatType: 'User',
       sender: senderId,
       receiver: receiverId,
@@ -127,15 +128,28 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
       'sender receiver',
       'name avatar username',
     );
-
     const recipientSocket = this.clients.get(receiverId);
 
-    if (recipientSocket && recipientSocket.readyState === WebSocket.OPEN) {
+    // 🟢 Step C: Manage unread metrics and inline metadata synchronization
+    const isRecipientActive =
+      recipientSocket && recipientSocket.readyState === WebSocket.OPEN;
+
+    await this.conversationModel.updateOne(
+      { _id: conversation._id },
+      {
+        $set: { lastMessage: newMessage._id, lastMessageAt: new Date() },
+        ...(isRecipientActive
+          ? {}
+          : { $inc: { 'participantSettings.$[elem].unreadCount': 1 } }),
+      },
+      { arrayFilters: [{ 'elem.user': receiverId }] },
+    );
+
+    if (isRecipientActive) {
       recipientSocket.send(
         JSON.stringify({ type: 'new_message', message: populated }),
       );
 
-      // 🟢 ADD THIS: Tell the sender the message was instantly delivered!
       client.send(
         JSON.stringify({
           type: 'message_delivered',
@@ -158,7 +172,7 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
   }
 
   // ==========================================
-  // 4. GROUP MESSAGING
+  // 4. GROUP MESSAGING (Linked to Conversations)
   // ==========================================
   @SubscribeMessage('group_message')
   async handleGroupMessage(
@@ -172,7 +186,25 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
     const group = await this.groupModel.findById(groupId);
     if (!group) return;
 
+    // Verify or register the structural group container inside conversations
+    let conversation = await this.conversationModel.findOne({
+      chatType: 'Group',
+      groupRef: groupId,
+    });
+    if (!conversation) {
+      conversation = await this.conversationModel.create({
+        chatType: 'Group',
+        groupRef: groupId,
+        participants: group.members.map((m: any) => m.user),
+        participantSettings: group.members.map((m: any) => ({
+          user: m.user,
+          unreadCount: 0,
+        })),
+      });
+    }
+
     const newMessage = await this.messageModel.create({
+      conversationId: conversation._id,
       chatType: 'Group',
       sender: senderId,
       receiver: groupId,
@@ -186,7 +218,8 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
       'sender',
       'name avatar username',
     );
-    const onlineInGroup: any[] = [];
+    const onlineInGroup: string[] = [];
+    const offlineInGroup: string[] = [];
 
     group.members.forEach((member: any) => {
       const memberId = member.user.toString();
@@ -194,7 +227,7 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
 
       const memberSocket = this.clients.get(memberId);
       if (memberSocket && memberSocket.readyState === WebSocket.OPEN) {
-        onlineInGroup.push(member.user);
+        onlineInGroup.push(memberId);
         memberSocket.send(
           JSON.stringify({
             type: 'group_message',
@@ -202,8 +235,22 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
             groupId,
           }),
         );
+      } else {
+        offlineInGroup.push(memberId);
       }
     });
+
+    // Update conversation metrics and bump unread counts for offline group members
+    await this.conversationModel.updateOne(
+      { _id: conversation._id },
+      {
+        $set: { lastMessage: newMessage._id, lastMessageAt: new Date() },
+        ...(offlineInGroup.length > 0
+          ? { $inc: { 'participantSettings.$[elem].unreadCount': 1 } }
+          : {}),
+      },
+      { arrayFilters: [{ 'elem.user': { $in: offlineInGroup } }] },
+    );
 
     if (onlineInGroup.length > 0) {
       await this.messageModel.updateOne(
@@ -227,9 +274,6 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
     );
   }
 
-  // ==========================================
-  // 5. TYPING INDICATORS
-  // ==========================================
   @SubscribeMessage('typing')
   handleTyping(@MessageBody() data: any, @ConnectedSocket() client: WebSocket) {
     const { receiverId, groupId, isTyping } = data;
@@ -260,7 +304,7 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
   }
 
   // ==========================================
-  // 6. READ RECEIPTS
+  // 6. READ RECEIPTS (CodeRabbit Authorized Workflow)
   // ==========================================
   @SubscribeMessage('read_receipt')
   async handleReadReceipt(
@@ -272,21 +316,53 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
     if (!userId) return;
 
     if (chatType === 'User') {
-      await this.messageModel.findByIdAndUpdate(messageId, {
-        status: 'read',
-        readAt: new Date(),
-      });
+      const readAt = new Date();
+      // 🟢 Fixes IDOR vulnerability by scoping query criteria to the active user
+      const readMessage = await this.messageModel.findOneAndUpdate(
+        { _id: messageId, chatType: 'User', receiver: userId },
+        { $set: { status: 'read', readAt } },
+        { new: true },
+      );
+
+      if (!readMessage) return;
+
+      // Clear unread counts for this conversation thread
+      await this.conversationModel.updateOne(
+        { _id: readMessage.conversationId, 'participantSettings.user': userId },
+        { $set: { 'participantSettings.$.unreadCount': 0 } },
+      );
+
+      // Emits confirmation read-receipt tokens to original senders
+      const senderSocket = this.clients.get(String(readMessage.sender));
+      if (senderSocket && senderSocket.readyState === WebSocket.OPEN) {
+        senderSocket.send(
+          JSON.stringify({
+            type: 'read_receipt',
+            messageId: readMessage._id,
+            readAt,
+          }),
+        );
+      }
     } else {
-      await this.messageModel.updateOne(
+      // Group Read-Receipt Handling
+      const updatedMessage = await this.messageModel.findOneAndUpdate(
         { _id: messageId, 'deliveryStatus.user': userId },
         { $set: { 'deliveryStatus.$.readAt': new Date() } },
+        { new: true },
       );
+
+      if (updatedMessage) {
+        await this.conversationModel.updateOne(
+          {
+            _id: updatedMessage.conversationId,
+            'participantSettings.user': userId,
+          },
+          { $set: { 'participantSettings.$.unreadCount': 0 } },
+        );
+      }
     }
   }
 
-  // ==========================================
-  // HELPER FUNCTIONS
-  // ==========================================
   private getUserIdFromSocket(client: WebSocket): string | null {
     for (const [userId, socket] of this.clients.entries()) {
       if (socket === client) return userId;
